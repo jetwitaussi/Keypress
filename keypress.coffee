@@ -16,7 +16,7 @@ limitations under the License.
 Keypress is a robust keyboard input capturing Javascript utility
 focused on input for games.
 
-version 1.0.3
+version 1.0.6
 ###
 
 ###
@@ -27,6 +27,7 @@ Options available and defaults:
     is_ordered      : false         - Unless this is set to true, the keys can be pressed down in any order
     is_counting     : false         - Makes this a counting combo (see documentation)
     is_exclusive    : false         - This combo will replace other exclusive combos when true
+    is_solitary     : false         - This combo will only fire if ONLY it's keys are pressed down
     is_sequence     : false         - Rather than a key combo, this is an ordered key sequence
     prevent_repeat  : false         - Prevent the combo from repeating when keydown is held.
     on_keyup        : null          - A function that is called when the combo is released
@@ -46,7 +47,6 @@ _sequence_timer = null
 _keys_down = []
 _active_combos = []
 _prevent_capture = false
-_event_classname = "keypress_events"
 _metakey = "ctrl"
 _modifier_keys = ["meta", "alt", "option", "ctrl", "shift", "cmd"]
 _valid_keys = []
@@ -93,27 +93,25 @@ _keys_remain = (combo) ->
 _fire = (event, combo, key_event) ->
     # Only fire this event if the function is defined
     if typeof combo["on_" + event] is "function"
-        if event is "release"
-            _prevent_default key_event, (combo["on_" + event].call(combo.this, key_event, combo.count) is false)
-        else
-            _prevent_default key_event, (combo["on_" + event].call(combo.this, key_event, combo.count) is false)
+        _prevent_default key_event, (combo["on_" + event].call(combo.this, key_event, combo.count) is false)
     # We need to mark that keyup has already happened
     if event is "release"
         combo.count = 0
     if event is "keyup"
         combo.keyup_fired = true
 
-_match_combo_arrays = (potential_match, source_combo_array, allow_partial_match=false) ->
+_match_combo_arrays = (potential_match) ->
     # This will return all combos that match
+    source_combo_array = _registered_combos
     matches = []
     for source_combo in source_combo_array
         continue if source_combo_array.is_sequence
         if source_combo.is_ordered
-            matches.push(source_combo) if potential_match.join("") is source_combo.keys.join("")
-            matches.push(source_combo) if allow_partial_match and potential_match.join("") is source_combo.keys.slice(0, potential_match.length).join("")
+            if potential_match.join("") is source_combo.keys.join("")
+                matches.push source_combo
         else
-            matches.push(source_combo) if _compare_arrays potential_match, source_combo.keys
-            matches.push(source_combo) if allow_partial_match and _compare_arrays potential_match, source_combo.keys.slice(0, potential_match.length)
+            if _compare_arrays potential_match, source_combo.keys
+                matches.push source_combo
     return matches
 
 _cmd_bug_check = (combo_keys) ->
@@ -128,39 +126,34 @@ _cmd_bug_check = (combo_keys) ->
 _get_active_combos = (key) ->
     # Based on the keys_down and the key just pressed or released
     # (which should not be in keys_down), we determine if any
-    # combo in registered_combos matches exactly.
+    # combo in registered_combos could be considered active.
     # This will return an array of active combos
 
-    potentials = []
+    active_combos = []
 
     # First check that every key in keys_down maps to a combo
     keys_down = _keys_down.filter (down_key) ->
         down_key isnt key
     keys_down.push key
-    perfect_matches = _match_combo_arrays keys_down, _registered_combos
-    potentials = perfect_matches if perfect_matches.length and _cmd_bug_check keys_down
-
-    is_exclusive = false
-    for potential in potentials
-        is_exclusive = true if potential.is_exclusive
+    perfect_matches = _match_combo_arrays keys_down
+    active_combos = perfect_matches if perfect_matches.length and _cmd_bug_check keys_down
 
     # Then work our way back through a combination with each other key down in order
     # This will match a combo even if some other key that is not part of the combo
     # is being held down.
     slice_up_array = (array) ->
+        return unless array.length > 1
         for i in [0...array.length]
             partial = array.slice()
             partial.splice i, 1
             continue unless partial.length
-            fuzzy_matches = _match_combo_arrays partial, _registered_combos
+            fuzzy_matches = _match_combo_arrays partial
             for fuzzy_match in fuzzy_matches
-                potentials.push(fuzzy_match) unless is_exclusive and fuzzy_match.is_exclusive
+                active_combos.push(fuzzy_match) unless fuzzy_match.is_solitary
             slice_up_array partial
         return
     slice_up_array keys_down
-
-    # Trying to return an array of matched combos
-    return potentials
+    return active_combos
 
 _get_potential_combos = (key) ->
     # Check if we are working towards pressing a combo.
@@ -173,7 +166,9 @@ _get_potential_combos = (key) ->
     return potentials
 
 _add_to_active_combos = (combo) ->
-    replaced = false
+    should_replace = false
+    should_prepend = true
+    already_replaced = false
     # An active combo is any combo which the user has already entered.
     # We use this to track when a user has released the last key of a
     # combo for on_release, and to keep combos from 'overlapping'.
@@ -184,21 +179,35 @@ _add_to_active_combos = (combo) ->
         # So compare the combo.keys to all active combos' keys.
         for i in [0..._active_combos.length]
             active_combo = _active_combos[i]
-            continue unless active_combo.is_exclusive and combo.is_exclusive
-            active_keys = active_combo.keys.slice()
-            for active_key in active_keys
-                is_match = true
-                unless active_key in combo.keys
-                    is_match = false
-                    break
-            if is_match
-                # In this case we'll just replace it
-                _active_combos.splice i, 1, combo
-                replaced = true
-                break
-    unless replaced
+            continue unless active_combo and active_combo.is_exclusive and combo.is_exclusive
+            active_keys = active_combo.keys
+
+            unless should_replace
+                for active_key in active_keys
+                    should_replace = true
+                    unless active_key in combo.keys
+                        should_replace = false
+                        break
+
+            if should_prepend and not should_replace
+                for combo_key in combo.keys
+                    should_prepend = false
+                    unless combo_key in active_keys
+                        should_prepend = true
+                        break
+
+            if should_replace
+                if already_replaced
+                    _active_combos.splice i, 1
+                else
+                    _active_combos.splice i, 1, combo
+                    already_replaced = true
+                should_prepend = false
+
+    if should_prepend
         _active_combos.unshift combo
-    return true
+
+    return should_replace or should_prepend
 
 _remove_from_active_combos = (combo) ->
     for i in [0..._active_combos.length]
@@ -342,17 +351,21 @@ _key_down = (key, e) ->
         _keys_down.push key
     return
 
-_handle_combo_up = (combo, e) ->
+_handle_combo_up = (combo, e, key) ->
     # Check if any keys from this combo are still being held.
     keys_remaining = _keys_remain combo
 
     # Any unactivated combos will fire, unless it is a counting combo with no keys remaining.
     # We don't fire those because they will fire on_release on their last key release.
     if !combo.keyup_fired and (!combo.is_counting or (combo.is_counting and keys_remaining))
-        _fire "keyup", combo, e
-        # Dont' add to the count unless we only have a keyup callback
-        if combo.is_counting and typeof combo.on_keyup is "function" and typeof combo.on_keydown isnt "function"
-            combo.count += 1 
+        # And we should not fire it if it is a solitary combo and something else is pressed
+        keys_down = _keys_down.slice()
+        keys_down.push key
+        if not combo.is_solitary or _compare_arrays keys_down, combo.keys
+            _fire "keyup", combo, e
+            # Dont' add to the count unless we only have a keyup callback
+            if combo.is_counting and typeof combo.on_keyup is "function" and typeof combo.on_keydown isnt "function"
+                combo.count += 1
 
     # If this was the last key released of the combo, clean up.
     unless keys_remaining
@@ -396,7 +409,7 @@ _key_up = (key, e) ->
         if key in active_combo.keys
             combos.push active_combo
     for combo in combos
-        _handle_combo_up combo, e
+        _handle_combo_up combo, e, key
 
     # We also need to check other combos that might still be in active_combos
     # and needs to be removed from it.
